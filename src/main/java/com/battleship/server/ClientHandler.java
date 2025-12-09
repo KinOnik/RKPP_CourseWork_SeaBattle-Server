@@ -6,6 +6,8 @@ import com.battleship.server.DAO.UserDAO;
 import java.io.*;
 import java.net.Socket;
 import java.net.SocketException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ClientHandler implements Runnable {
     private final Socket socket;
@@ -13,6 +15,7 @@ public class ClientHandler implements Runnable {
     private ObjectInputStream in;
     private User currentUser = null;
     private final UserDAO userDAO = new UserDAO();
+    private final Map<String, Game> activeGames = new ConcurrentHashMap<>();
 
     public ClientHandler(Socket socket) {
         this.socket = socket;
@@ -41,6 +44,7 @@ public class ClientHandler implements Runnable {
         switch (msg.getType()) {
             case REGISTER -> handleRegister(msg);
             case LOGIN -> handleLogin(msg);
+            case START_NEW_GAME -> handleStartNewGame();
             default -> send(new Message(MessageType.ERROR, "Сначала авторизуйся"));
         }
     }
@@ -84,6 +88,20 @@ public class ClientHandler implements Runnable {
             System.out.println("Успешный вход: " + login);
         } else {
             send(new Message(MessageType.LOGIN_FAIL, "Неверный логин или пароль"));
+        }
+    }
+
+    private void handleStartNewGame() throws IOException {
+        try {
+            Game game = new Game(currentUser.getLogin());
+            activeGames.put(currentUser.getLogin(), game);
+            send(new Message(MessageType.GAME_STATE, game));
+            System.out.println("Новая игра создана для " + currentUser.getLogin());
+        } catch (Exception e) {
+            e.printStackTrace();
+            try {
+                send(new Message(MessageType.ERROR, "Ошибка создания игры"));
+            } catch (Exception ignored) {}
         }
     }
 
