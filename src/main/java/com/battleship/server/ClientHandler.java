@@ -25,6 +25,7 @@ public class ClientHandler implements Runnable {
     public void run() {
         try {
             out = new ObjectOutputStream(socket.getOutputStream());
+            out.flush();
             in = new ObjectInputStream(socket.getInputStream());
 
             while (true) {
@@ -92,17 +93,13 @@ public class ClientHandler implements Runnable {
     }
 
     private void handleStartNewGame() throws IOException {
-        try {
-            Game game = new Game(currentUser.getLogin());
-            activeGames.put(currentUser.getLogin(), game);
-            send(new Message(MessageType.GAME_STATE, game));
-            System.out.println("Новая игра создана для " + currentUser.getLogin());
-        } catch (Exception e) {
-            e.printStackTrace();
-            try {
-                send(new Message(MessageType.ERROR, "Ошибка создания игры"));
-            } catch (Exception ignored) {}
-        }
+        Game game = new Game(currentUser.getLogin());
+        activeGames.put(currentUser.getLogin(), game);
+
+        out.writeObject(new Message(MessageType.GAME_STATE, game));
+        out.flush();
+
+        System.out.println("Игра отправлена игроку " + currentUser.getLogin());
     }
 
     private void send(Message msg) throws IOException {

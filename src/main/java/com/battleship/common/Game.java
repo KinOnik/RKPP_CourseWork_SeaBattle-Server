@@ -19,5 +19,45 @@ public class Game implements Serializable {
         this.playerName = playerName;
     }
 
+    private void placeComputerShipsRandomly() {
+        Random r = new Random();
+        int[] sizes = {4, 3, 3, 2, 2, 2, 1, 1, 1, 1};
+        for (int size : sizes) {
+            while (true) {
+                boolean vertical = r.nextBoolean();
+                int x = r.nextInt(vertical ? 10 : 11 - size);
+                int y = r.nextInt(vertical ? 11 - size : 10);
+
+                if (canPlaceShip(computerField, x, y, size, vertical)) {
+                    placeShip(computerField, computerShips, x, y, size, vertical);
+                    break;
+                }
+            }
+        }
+    }
+
+    private boolean canPlaceShip(boolean[][] field, int x, int y, int size, boolean vertical) {
+        for (int i = -1; i <= size; i++) {
+            for (int j = -1; j <= (vertical ? 1 : size); j++) {
+                int dx = vertical ? j : i;
+                int dy = vertical ? i : j;
+                int nx = x + dx, ny = y + dy;
+                if (nx >= 0 && nx < 10 && ny >= 0 && ny < 10 && field[nx][ny]) return false;
+            }
+        }
+        return true;
+    }
+
+    private void placeShip(boolean[][] field, List<Ship> ships, int x, int y, int size, boolean vertical) {
+        Ship ship = new Ship(size);
+        ship.isVertical = vertical;
+        for (int i = 0; i < size; i++) {
+            int dx = vertical ? 0 : i;
+            int dy = vertical ? i : 0;
+            field[x + dx][y + dy] = true;
+            ship.cells.add(new int[]{x + dx, y + dy});
+        }
+        ships.add(ship);
+    }
 
 }
