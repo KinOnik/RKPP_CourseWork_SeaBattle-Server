@@ -103,7 +103,7 @@ public class ClientHandler implements Runnable {
         activeGames.put(currentUser.getLogin(), game);
 
         game.state = GameState.PLAYER_TURN;
-        send(new Message(MessageType.GAME_START, true)); // начало боя
+        send(new Message(MessageType.GAME_START, true));
 
         System.out.println(currentUser.getLogin() + " завершил расстановку. Бой начат!");
     }
@@ -116,9 +116,19 @@ public class ClientHandler implements Runnable {
         Game game = activeGames.get(currentUser.getLogin());
 
         boolean hit = game.computerField[row][col];
-        game.computerField[row][col] = false; // помечаем как выстрелено
 
-        // Отправляем результат игроку
+        if (hit) {
+            game.computerField[row][col] = false;
+            for (Ship ship : game.computerShips) {
+                for (int[] cell : ship.cells) {
+                    if (cell[0] == row && cell[1] == col) {
+                        ship.hits++;
+                        break;
+                    }
+                }
+            }
+        }
+
         send(new Message(MessageType.SHOT_RESULT, new int[]{row, col, hit ? 1 : 0}));
 
         // Проверка победы игрока
@@ -134,7 +144,19 @@ public class ClientHandler implements Runnable {
         int aiRow = aiShot[0];
         int aiCol = aiShot[1];
         boolean aiHit = game.playerField[aiRow][aiCol];
-        game.playerField[aiRow][aiCol] = false;
+
+        if (aiHit) {
+            game.playerField[aiRow][aiCol] = false;
+
+            for (Ship ship : game.playerShips) {
+                for (int[] cell : ship.cells) {
+                    if (cell[0] == aiRow && cell[1] == aiCol) {
+                        ship.hits++;
+                        break;
+                    }
+                }
+            }
+        }
 
         send(new Message(MessageType.OPPONENT_SHOT, new int[]{aiRow, aiCol, aiHit ? 1 : 0}));
 
@@ -148,11 +170,23 @@ public class ClientHandler implements Runnable {
     private int[] computerTurn(Game game) {
         Random rnd = new Random();
         int row, col;
-        do {
-            row = rnd.nextInt(10);
-            col = rnd.nextInt(10);
-        } while (game.computerHits[row][col]); // не стрелять по уже выстреленным
-        return new int[]{row, col};
+
+        List<int[]> availableCells = new ArrayList<>();
+        for (int r = 0; r < 10; r++) {
+            for (int c = 0; c < 10; c++) {
+                if (!game.playerHits[r][c]) {
+                    availableCells.add(new int[]{r, c});
+                }
+            }
+        }
+
+        if (!availableCells.isEmpty()) {
+            int[] cell = availableCells.get(rnd.nextInt(availableCells.size()));
+            game.playerHits[cell[0]][cell[1]] = true;
+            return cell;
+        }
+
+        return new int[]{rnd.nextInt(10), rnd.nextInt(10)};
     }
 
     private boolean allSunk(List<Ship> ships) {
