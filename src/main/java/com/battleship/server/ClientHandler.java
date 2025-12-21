@@ -6,7 +6,6 @@ import com.battleship.server.DAO.UserDAO;
 
 import java.io.*;
 import java.net.Socket;
-import java.net.SocketException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -15,8 +14,12 @@ public class ClientHandler implements Runnable {
     private ObjectOutputStream out;
     private ObjectInputStream in;
     private User currentUser = null;
+    private String authToken = null;
+    private static final Map<String, String> activeTokens = new ConcurrentHashMap<>();
+
     private final UserDAO userDAO = new UserDAO();
     private final Map<String, Game> activeGames = new ConcurrentHashMap<>();
+    private final Map<String, ComputerStrategy> computerStrategies = new ConcurrentHashMap<>();
 
     public ClientHandler(Socket socket) {
         this.socket = socket;
@@ -44,9 +47,11 @@ public class ClientHandler implements Runnable {
         switch (msg.getType()) {
             case REGISTER -> handleRegister(msg);
             case LOGIN -> handleLogin(msg);
+            case RECONNECT_TOKEN -> handleReconnect(msg);
             case START_NEW_GAME -> handleStartNewGame();
             case PLACE_SHIPS -> handlePlaceShips(msg);
             case SHOT -> handleShot(msg);
+            case LOBBY_ENTER -> handleLobbyEnter();
             default -> {
                 if (currentUser == null) {
                     send(new Message(MessageType.ERROR, "Сначала авторизуйся"));
@@ -70,7 +75,7 @@ public class ClientHandler implements Runnable {
         User user = new User(login, hash, salt);
         userDAO.register(user);
 
-        send(new Message(MessageType.REGISTER_SUCCESS));
+        send(new Message(MessageType.REGISTER_SUCCESS, "Выполните вход"));
         System.out.println("Зарегистрирован: " + login);
     }
 
@@ -86,12 +91,32 @@ public class ClientHandler implements Runnable {
         }
 
         this.currentUser = user;
+        this.authToken = UUID.randomUUID().toString();
+        activeTokens.put(this.authToken, login);
+
         send(new Message(MessageType.LOGIN_SUCCESS, login));
+        send(new Message(MessageType.AUTH_TOKEN, this.authToken));
         System.out.println("Вошёл: " + login);
+    }
+
+    private void handleReconnect(Message msg) throws IOException {
+        String token = (String) msg.getPayload();
+        String login = activeTokens.get(token);
+
+        if (login != null) {
+            this.currentUser = userDAO.findByLogin(login);
+            this.authToken = token;
+            send(new Message(MessageType.LOGIN_SUCCESS, login));
+            System.out.println("Переподключение по токену: " + login);
+        } else {
+            send(new Message(MessageType.LOGIN_FAIL, "Токен недействителен"));
+            close();
+        }
     }
 
     private void handleStartNewGame() throws IOException {
         Game game = new Game(currentUser.getLogin());
+        game.difficulty = "Средний";
         activeGames.put(currentUser.getLogin(), game);
 
         send(new Message(MessageType.GAME_STATE, game));
@@ -105,7 +130,9 @@ public class ClientHandler implements Runnable {
         game.state = GameState.PLAYER_TURN;
         send(new Message(MessageType.GAME_START, true));
 
-        System.out.println(currentUser.getLogin() + " завершил расстановку. Бой начат!");
+        computerStrategies.put(currentUser.getLogin(), new ComputerStrategy());
+
+        System.out.println(currentUser.getLogin() + " завершил расстановку | Сложность: " + game.difficulty);
     }
 
     private void handleShot(Message msg) throws IOException {
@@ -114,86 +141,136 @@ public class ClientHandler implements Runnable {
         int col = coord[1];
 
         Game game = activeGames.get(currentUser.getLogin());
+        if (game.computerHits[row][col]) {
+            send(new Message(MessageType.ERROR, "Вы уже стреляли в эту клетку!"));
+            return;
+        }
 
         boolean hit = game.computerField[row][col];
+        game.computerHits[row][col] = true;
 
+        Ship sunkShip = null;
         if (hit) {
             game.computerField[row][col] = false;
-            for (Ship ship : game.computerShips) {
-                for (int[] cell : ship.cells) {
-                    if (cell[0] == row && cell[1] == col) {
-                        ship.hits++;
-                        break;
-                    }
-                }
+            Ship ship = updateShipHits(game.computerShips, row, col);
+            if (ship != null && ship.hits == ship.size) {
+                sunkShip = ship;
             }
         }
 
         send(new Message(MessageType.SHOT_RESULT, new int[]{row, col, hit ? 1 : 0}));
 
-        // Проверка победы игрока
+        if (sunkShip != null) {
+            Object[] payload = {sunkShip.cells, false}; // false — поле противника
+            send(new Message(MessageType.SHIP_SUNK, payload));
+        }
+
         if (allSunk(game.computerShips)) {
             send(new Message(MessageType.GAME_OVER, true));
             activeGames.remove(currentUser.getLogin());
+            computerStrategies.remove(currentUser.getLogin());
             System.out.println(currentUser.getLogin() + " ПОБЕДИЛ!");
             return;
         }
 
-        // Ход компьютера
-        int[] aiShot = computerTurn(game);
-        int aiRow = aiShot[0];
-        int aiCol = aiShot[1];
-        boolean aiHit = game.playerField[aiRow][aiCol];
+        if (!hit) {
+            new Thread(() -> {
+                try {
+                    Thread.sleep(1000);
+                    computerTurn(game);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }).start();
+        }
+    }
 
-        if (aiHit) {
-            game.playerField[aiRow][aiCol] = false;
+    private void handleLobbyEnter() throws IOException {
+        System.out.println(currentUser.getLogin() + " вернулся в лобби");
+    }
 
-            for (Ship ship : game.playerShips) {
-                for (int[] cell : ship.cells) {
-                    if (cell[0] == aiRow && cell[1] == aiCol) {
-                        ship.hits++;
-                        break;
-                    }
+    private void computerTurn(Game game) throws IOException {
+        ComputerStrategy strategy = computerStrategies.get(currentUser.getLogin());
+        int[] shot = getComputerShot(game, strategy);
+
+        int row = shot[0];
+        int col = shot[1];
+
+        boolean hit = game.playerField[row][col];
+        game.playerHits[row][col] = true;
+
+        Ship sunkShip = null;
+        if (hit) {
+            game.playerField[row][col] = false;
+            Ship ship = updateShipHits(game.playerShips, row, col);
+            if (ship != null && ship.hits == ship.size) {
+                sunkShip = ship;
+            }
+            strategy.recordHit(row, col);
+        } else {
+            strategy.recordMiss();
+        }
+
+        send(new Message(MessageType.OPPONENT_SHOT, new int[]{row, col, hit ? 1 : 0}));
+
+        if (sunkShip != null) {
+            Object[] payload = {sunkShip.cells, true}; // true — поле игрока
+            send(new Message(MessageType.SHIP_SUNK, payload));
+
+            ComputerStrategy compStrategy = computerStrategies.get(currentUser.getLogin());
+            if (compStrategy != null) {
+                for (int[] cell : sunkShip.cells) {
+                    compStrategy.hitCells.remove(cell[0] + "," + cell[1]);
                 }
             }
         }
-
-        send(new Message(MessageType.OPPONENT_SHOT, new int[]{aiRow, aiCol, aiHit ? 1 : 0}));
 
         if (allSunk(game.playerShips)) {
             send(new Message(MessageType.GAME_OVER, false));
             activeGames.remove(currentUser.getLogin());
-            System.out.println(currentUser.getLogin() + " проиграл...");
+            computerStrategies.remove(currentUser.getLogin());
+            return;
+        }
+
+        if (hit) {
+            new Thread(() -> {
+                try {
+                    Thread.sleep(1000);
+                    computerTurn(game);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }).start();
         }
     }
 
-    private int[] computerTurn(Game game) {
-        Random rnd = new Random();
-        int row, col;
+    private int[] getComputerShot(Game game, ComputerStrategy strategy) {
+        return switch (game.difficulty) {
+            case "Лёгкий" -> strategy.getRandomShot(game);
+            //case "Средний" -> ;
+            //case "Сложный" -> ;
+            default -> strategy.getRandomShot(game);
+        };
+    }
 
-        List<int[]> availableCells = new ArrayList<>();
-        for (int r = 0; r < 10; r++) {
-            for (int c = 0; c < 10; c++) {
-                if (!game.playerHits[r][c]) {
-                    availableCells.add(new int[]{r, c});
+    private Ship updateShipHits(List<Ship> ships, int row, int col) {
+        for (Ship ship : ships) {
+            for (int[] cell : ship.cells) {
+                if (cell[0] == row && cell[1] == col) {
+                    ship.hits++;
+                    return ship;
                 }
             }
         }
-
-        if (!availableCells.isEmpty()) {
-            int[] cell = availableCells.get(rnd.nextInt(availableCells.size()));
-            game.playerHits[cell[0]][cell[1]] = true;
-            return cell;
-        }
-
-        return new int[]{rnd.nextInt(10), rnd.nextInt(10)};
+        return null;
     }
 
     private boolean allSunk(List<Ship> ships) {
-        for (Ship ship : ships) {
-            if (!ship.isSunk()) return false;
-        }
-        return true;
+        return ships.stream().allMatch(s -> s.hits >= s.size);
     }
 
     private void send(Message msg) throws IOException {
@@ -202,8 +279,37 @@ public class ClientHandler implements Runnable {
     }
 
     private void close() {
+        if (authToken != null) {
+            activeTokens.remove(authToken);
+        }
         try { if (out != null) out.close(); } catch (IOException ignored) {}
         try { if (in != null) in.close(); } catch (IOException ignored) {}
         try { socket.close(); } catch (IOException ignored) {}
+    }
+
+    private static class ComputerStrategy {
+        private final Set<String> hitCells = new HashSet<>();
+        private int[] lastHit = null;
+        private int currentDirection = -1;
+
+        void recordHit(int row, int col) {
+            hitCells.add(row + "," + col);
+            lastHit = new int[]{row, col};
+            currentDirection = -1;
+        }
+
+        void recordMiss() {
+            currentDirection = -1;
+        }
+
+        int[] getRandomShot(Game game) {
+            Random rnd = new Random();
+            int row, col;
+            do {
+                row = rnd.nextInt(10);
+                col = rnd.nextInt(10);
+            } while (game.playerHits[row][col]);
+            return new int[]{row, col};
+        }
     }
 }

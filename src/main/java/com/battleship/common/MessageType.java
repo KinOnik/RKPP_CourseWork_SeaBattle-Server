@@ -3,6 +3,8 @@ package com.battleship.common;
 public enum MessageType {
     REGISTER,
     LOGIN,
+    AUTH_TOKEN,
+    RECONNECT_TOKEN,
     REGISTER_SUCCESS,
     REGISTER_FAIL,
     LOGIN_SUCCESS,
@@ -13,9 +15,11 @@ public enum MessageType {
     PLACE_SHIPS,
     SHOT,
     SHOT_RESULT,
+    SHIP_SUNK,
     GAME_START,
     GAME_STATE,
     OPPONENT_SHOT,
     GAME_OVER,
+    LOBBY_ENTER,
     ERROR
 }
