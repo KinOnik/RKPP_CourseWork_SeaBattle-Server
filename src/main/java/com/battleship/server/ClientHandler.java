@@ -251,8 +251,8 @@ public class ClientHandler implements Runnable {
     private int[] getComputerShot(Game game, ComputerStrategy strategy) {
         return switch (game.difficulty) {
             case "Лёгкий" -> strategy.getRandomShot(game);
-            //case "Средний" -> ;
-            //case "Сложный" -> ;
+            case "Средний" -> strategy.getMediumShot(game);
+            case "Сложный" -> strategy.getHardShot(game);
             default -> strategy.getRandomShot(game);
         };
     }
@@ -310,6 +310,58 @@ public class ClientHandler implements Runnable {
                 col = rnd.nextInt(10);
             } while (game.playerHits[row][col]);
             return new int[]{row, col};
+        }
+
+        int[] getMediumShot(Game game) {
+            if (!hitCells.isEmpty()) {
+                for (String hit : hitCells) {
+                    String[] parts = hit.split(",");
+                    int r = Integer.parseInt(parts[0]);
+                    int c = Integer.parseInt(parts[1]);
+                    int[][] dirs = {{-1,0},{1,0},{0,-1},{0,1}};
+                    for (int[] d : dirs) {
+                        int nr = r + d[0];
+                        int nc = c + d[1];
+                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 && !game.playerHits[nr][nc]) {
+                            return new int[]{nr, nc};
+                        }
+                    }
+                }
+            }
+            return getRandomShot(game);
+        }
+
+        int[] getHardShot(Game game) {
+            if (!hitCells.isEmpty()) {
+                if (lastHit != null) {
+                    int[][] dirs = {{-1,0},{1,0},{0,-1},{0,1}};
+                    if (currentDirection == -1) {
+                        for (int d = 0; d < 4; d++) {
+                            int nr = lastHit[0] + dirs[d][0];
+                            int nc = lastHit[1] + dirs[d][1];
+                            if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 && hitCells.contains(nr + "," + nc)) {
+                                currentDirection = d;
+                                break;
+                            }
+                        }
+                    }
+                    if (currentDirection != -1) {
+                        int nr = lastHit[0] + dirs[currentDirection][0];
+                        int nc = lastHit[1] + dirs[currentDirection][1];
+                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 && !game.playerHits[nr][nc]) {
+                            return new int[]{nr, nc};
+                        }
+                        int opp = (currentDirection % 2 == 0) ? currentDirection + 1 : currentDirection - 1;
+                        nr = lastHit[0] + dirs[opp][0];
+                        nc = lastHit[1] + dirs[opp][1];
+                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 && !game.playerHits[nr][nc]) {
+                            return new int[]{nr, nc};
+                        }
+                    }
+                }
+                return getMediumShot(game);
+            }
+            return getRandomShot(game);
         }
     }
 }
