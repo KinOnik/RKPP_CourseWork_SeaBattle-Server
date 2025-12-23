@@ -18,6 +18,7 @@ public class ClientHandler implements Runnable {
     private static final Map<String, String> activeTokens = new ConcurrentHashMap<>();
 
     private final UserDAO userDAO = new UserDAO();
+    private final GameDAO gameDAO = new GameDAO();
     private final Map<String, Game> activeGames = new ConcurrentHashMap<>();
     private final Map<String, ComputerStrategy> computerStrategies = new ConcurrentHashMap<>();
 
@@ -52,6 +53,10 @@ public class ClientHandler implements Runnable {
             case PLACE_SHIPS -> handlePlaceShips(msg);
             case SHOT -> handleShot(msg);
             case LOBBY_ENTER -> handleLobbyEnter();
+            case SAVE_GAME -> handleSaveGame();
+            case GAME_LIST -> handleGameList();
+            case CONTINUE_GAME -> handleContinueGame(msg);
+            case DELETE_SAVE -> handleDeleteSave(msg);
             default -> {
                 if (currentUser == null) {
                     send(new Message(MessageType.ERROR, "Сначала авторизуйся"));
@@ -75,8 +80,14 @@ public class ClientHandler implements Runnable {
         User user = new User(login, hash, salt);
         userDAO.register(user);
 
-        send(new Message(MessageType.REGISTER_SUCCESS, "Выполните вход"));
-        System.out.println("Зарегистрирован: " + login);
+        this.currentUser = user;
+        this.authToken = UUID.randomUUID().toString();
+        activeTokens.put(this.authToken, login);
+
+        send(new Message(MessageType.LOGIN_SUCCESS, login));
+        send(new Message(MessageType.AUTH_TOKEN, this.authToken));
+
+        System.out.println("Зарегистрирован и автоматически вошёл: " + login);
     }
 
     private void handleLogin(Message msg) throws IOException {
@@ -124,15 +135,33 @@ public class ClientHandler implements Runnable {
     }
 
     private void handlePlaceShips(Message msg) throws IOException {
-        Game game = (Game) msg.getPayload();
-        activeGames.put(currentUser.getLogin(), game);
+        Game receivedGame = (Game) msg.getPayload();
+        String login = currentUser.getLogin();
 
-        game.state = GameState.PLAYER_TURN;
-        send(new Message(MessageType.GAME_START, true));
+        Game activeGame = activeGames.get(login);
+        if (activeGame == null) {
+            send(new Message(MessageType.ERROR, "Игра не найдена"));
+            return;
+        }
 
-        computerStrategies.put(currentUser.getLogin(), new ComputerStrategy());
+        // Копируем расстановку игрока
+        for (int i = 0; i < 10; i++) {
+            System.arraycopy(receivedGame.playerField[i], 0, activeGame.playerField[i], 0, 10);
+        }
+        activeGame.playerShips.clear();
+        activeGame.playerShips.addAll(receivedGame.playerShips);
+        activeGame.difficulty = receivedGame.difficulty;
 
-        System.out.println(currentUser.getLogin() + " завершил расстановку | Сложность: " + game.difficulty);
+        // Создаём стратегию ИИ
+        computerStrategies.put(login, new ComputerStrategy());
+
+        // Отправляем обновлённое состояние игры (GAME_STATE)
+        send(new Message(MessageType.GAME_STATE, activeGame));
+
+        // Отправляем GAME_START (если нужно для уведомления)
+        send(new Message(MessageType.GAME_START));
+
+        System.out.println(login + " завершил расстановку | Сложность: " + activeGame.difficulty);
     }
 
     private void handleShot(Message msg) throws IOException {
@@ -167,6 +196,7 @@ public class ClientHandler implements Runnable {
 
         if (allSunk(game.computerShips)) {
             send(new Message(MessageType.GAME_OVER, true));
+            gameDAO.deleteGame(currentUser.getLogin(), "autosave_latest.dat");
             activeGames.remove(currentUser.getLogin());
             computerStrategies.remove(currentUser.getLogin());
             System.out.println(currentUser.getLogin() + " ПОБЕДИЛ!");
@@ -185,10 +215,56 @@ public class ClientHandler implements Runnable {
                 }
             }).start();
         }
+        Game gameSave = activeGames.get(currentUser.getLogin());
+        if (gameSave != null) {
+            gameDAO.autosaveLatest(currentUser.getLogin(), gameSave);
+        }
     }
 
     private void handleLobbyEnter() throws IOException {
         System.out.println(currentUser.getLogin() + " вернулся в лобби");
+    }
+
+    private void handleSaveGame() throws IOException {
+        Game game = activeGames.get(currentUser.getLogin());
+        if (game != null) {
+            String filename = gameDAO.saveGame(currentUser.getLogin(), game, false);  // Ручное
+            if (filename != null) {
+                send(new Message(MessageType.GAME_STATE, "Игра сохранена: " + filename));
+            } else {
+                send(new Message(MessageType.ERROR, "Ошибка сохранения"));
+            }
+        } else {
+            send(new Message(MessageType.ERROR, "Нет активной игры"));
+        }
+    }
+
+    private void handleGameList() throws IOException {
+        List<Object[]> list = gameDAO.getGameList(currentUser.getLogin());
+
+        Object[][] array = list.toArray(new Object[0][]);
+        send(new Message(MessageType.GAME_LIST, array));
+
+        System.out.println("Отправлен список сохранений для " + currentUser.getLogin() + ": " + list.size() + " файлов");
+    }
+
+    private void handleContinueGame(Message msg) throws IOException {
+        String filename = (String) msg.getPayload();
+        Game game = gameDAO.loadGame(currentUser.getLogin(), filename);
+        if (game != null) {
+            activeGames.put(currentUser.getLogin(), game);
+            computerStrategies.put(currentUser.getLogin(), new ComputerStrategy());  // Новая стратегия
+            send(new Message(MessageType.GAME_STATE, game));
+            System.out.println(currentUser.getLogin() + " продолжил игру из " + filename);
+        } else {
+            send(new Message(MessageType.ERROR, "Ошибка загрузки"));
+        }
+    }
+
+    private void handleDeleteSave(Message msg) throws IOException {
+        String filename = (String) msg.getPayload();
+        boolean success = gameDAO.deleteGame(currentUser.getLogin(), filename);
+        send(new Message(MessageType.GAME_STATE, success ? "Удалено" : "Ошибка удаления"));
     }
 
     private void computerTurn(Game game) throws IOException {
@@ -229,6 +305,7 @@ public class ClientHandler implements Runnable {
 
         if (allSunk(game.playerShips)) {
             send(new Message(MessageType.GAME_OVER, false));
+            gameDAO.deleteGame(currentUser.getLogin(), "autosave_latest.dat");
             activeGames.remove(currentUser.getLogin());
             computerStrategies.remove(currentUser.getLogin());
             return;
@@ -245,6 +322,10 @@ public class ClientHandler implements Runnable {
                     e.printStackTrace();
                 }
             }).start();
+        }
+        Game gameSave = activeGames.get(currentUser.getLogin());
+        if (gameSave != null) {
+            gameDAO.autosaveLatest(currentUser.getLogin(), gameSave);
         }
     }
 
@@ -279,12 +360,32 @@ public class ClientHandler implements Runnable {
     }
 
     private void close() {
+        // Сначала — автосохранение при отключении (если была активная незавершённая игра)
+        if (currentUser != null) {
+            Game game = activeGames.get(currentUser.getLogin());
+            if (game != null) {  // на всякий случай, если игра не завершена
+                String filename = gameDAO.saveGame(currentUser.getLogin(), game, true);  // true = autosave с датой
+                if (filename != null) {
+                    System.out.println("Автосохранение при отключении для " + currentUser.getLogin() + ": " + filename);
+                }
+            }
+        }
+
+        // Удаляем токен
         if (authToken != null) {
             activeTokens.remove(authToken);
         }
+
+        // Закрываем ресурсы
         try { if (out != null) out.close(); } catch (IOException ignored) {}
         try { if (in != null) in.close(); } catch (IOException ignored) {}
         try { socket.close(); } catch (IOException ignored) {}
+
+        // Опционально: можно удалить activeGame и стратегию здесь тоже
+        if (currentUser != null) {
+            activeGames.remove(currentUser.getLogin());
+            computerStrategies.remove(currentUser.getLogin());
+        }
     }
 
     private static class ComputerStrategy {

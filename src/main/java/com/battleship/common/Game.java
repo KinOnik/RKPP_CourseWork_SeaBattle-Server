@@ -5,7 +5,6 @@ import java.util.*;
 
 public class Game implements Serializable {
     public final String playerName;
-    public GameState state = GameState.PLACING_SHIPS;
     public String difficulty = "Средний";
 
     public final boolean[][] playerField = new boolean[10][10];
