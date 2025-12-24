@@ -126,6 +126,10 @@ public class ClientHandler implements Runnable {
     }
 
     private void handleStartNewGame() throws IOException {
+        gameDAO.deleteGame(currentUser.getLogin(), "autosave_latest.dat");
+        activeGames.remove(currentUser.getLogin());
+        computerStrategies.remove(currentUser.getLogin());
+
         Game game = new Game(currentUser.getLogin());
         game.difficulty = "Средний";
         activeGames.put(currentUser.getLogin(), game);
@@ -144,23 +148,12 @@ public class ClientHandler implements Runnable {
             return;
         }
 
-        // Копируем расстановку игрока
-        for (int i = 0; i < 10; i++) {
-            System.arraycopy(receivedGame.playerField[i], 0, activeGame.playerField[i], 0, 10);
-        }
-        activeGame.playerShips.clear();
-        activeGame.playerShips.addAll(receivedGame.playerShips);
+        activeGame.copyPlayerShipsFrom(receivedGame);
         activeGame.difficulty = receivedGame.difficulty;
 
-        // Создаём стратегию ИИ
         computerStrategies.put(login, new ComputerStrategy());
 
-        // Отправляем обновлённое состояние игры (GAME_STATE)
-        send(new Message(MessageType.GAME_STATE, activeGame));
-
-        // Отправляем GAME_START (если нужно для уведомления)
-        send(new Message(MessageType.GAME_START));
-
+        send(new Message(MessageType.GAME_START, activeGame));
         System.out.println(login + " завершил расстановку | Сложность: " + activeGame.difficulty);
     }
 
@@ -170,38 +163,55 @@ public class ClientHandler implements Runnable {
         int col = coord[1];
 
         Game game = activeGames.get(currentUser.getLogin());
-        if (game.computerHits[row][col]) {
+        if (game == null) {
+            send(new Message(MessageType.ERROR, "Игра не найдена"));
+            return;
+        }
+
+        if (!game.isPlayerTurn) {
+            send(new Message(MessageType.ERROR, "Сейчас не ваш ход"));
+            return;
+        }
+
+        if (game.playerShots[row][col] != Game.CELL_EMPTY) {
             send(new Message(MessageType.ERROR, "Вы уже стреляли в эту клетку!"));
             return;
         }
 
-        boolean hit = game.computerField[row][col];
-        game.computerHits[row][col] = true;
+        boolean hit = game.computerField[row][col] == Game.CELL_SHIP;
 
-        Ship sunkShip = null;
         if (hit) {
-            game.computerField[row][col] = false;
-            Ship ship = updateShipHits(game.computerShips, row, col);
-            if (ship != null && ship.hits == ship.size) {
-                sunkShip = ship;
+            game.playerShots[row][col] = Game.CELL_HIT;
+            game.computerField[row][col] = Game.CELL_HIT;
+
+            if (game.isShipSunk(game.computerShips, game.playerShots, row, col)) {
+                game.markSunkShip(game.computerShips, game.computerField, game.playerShots, row, col);
+                game.computerSunkShips++;
+
+                Ship sunkShip = findSunkShip(game.computerShips, row, col);
+                if (sunkShip != null) {
+                    Object[] payload = {sunkShip.cells, false}; // false — поле противника
+                    send(new Message(MessageType.SHIP_SUNK, payload));
+                }
             }
+
+            if (game.computerSunkShips == game.computerShips.size()) {
+                game.gameOver = true;
+                game.playerWon = true;
+                send(new Message(MessageType.GAME_OVER, true));
+                gameDAO.deleteGame(currentUser.getLogin(), "autosave_latest.dat");
+                activeGames.remove(currentUser.getLogin());
+                computerStrategies.remove(currentUser.getLogin());
+                System.out.println(currentUser.getLogin() + " ПОБЕДИЛ!");
+                return;
+            }
+        } else {
+            game.playerShots[row][col] = Game.CELL_MISS;
+            game.computerField[row][col] = Game.CELL_MISS;
+            game.isPlayerTurn = false;
         }
 
         send(new Message(MessageType.SHOT_RESULT, new int[]{row, col, hit ? 1 : 0}));
-
-        if (sunkShip != null) {
-            Object[] payload = {sunkShip.cells, false}; // false — поле противника
-            send(new Message(MessageType.SHIP_SUNK, payload));
-        }
-
-        if (allSunk(game.computerShips)) {
-            send(new Message(MessageType.GAME_OVER, true));
-            gameDAO.deleteGame(currentUser.getLogin(), "autosave_latest.dat");
-            activeGames.remove(currentUser.getLogin());
-            computerStrategies.remove(currentUser.getLogin());
-            System.out.println(currentUser.getLogin() + " ПОБЕДИЛ!");
-            return;
-        }
 
         if (!hit) {
             new Thread(() -> {
@@ -215,10 +225,8 @@ public class ClientHandler implements Runnable {
                 }
             }).start();
         }
-        Game gameSave = activeGames.get(currentUser.getLogin());
-        if (gameSave != null) {
-            gameDAO.autosaveLatest(currentUser.getLogin(), gameSave);
-        }
+
+        gameDAO.autosaveLatest(currentUser.getLogin(), game);
     }
 
     private void handleLobbyEnter() throws IOException {
@@ -228,7 +236,9 @@ public class ClientHandler implements Runnable {
     private void handleSaveGame() throws IOException {
         Game game = activeGames.get(currentUser.getLogin());
         if (game != null) {
-            String filename = gameDAO.saveGame(currentUser.getLogin(), game, false);  // Ручное
+            saveStrategyToGame(game);
+
+            String filename = gameDAO.saveGame(currentUser.getLogin(), game, false);
             if (filename != null) {
                 send(new Message(MessageType.GAME_STATE, "Игра сохранена: " + filename));
             } else {
@@ -241,10 +251,8 @@ public class ClientHandler implements Runnable {
 
     private void handleGameList() throws IOException {
         List<Object[]> list = gameDAO.getGameList(currentUser.getLogin());
-
         Object[][] array = list.toArray(new Object[0][]);
         send(new Message(MessageType.GAME_LIST, array));
-
         System.out.println("Отправлен список сохранений для " + currentUser.getLogin() + ": " + list.size() + " файлов");
     }
 
@@ -253,9 +261,13 @@ public class ClientHandler implements Runnable {
         Game game = gameDAO.loadGame(currentUser.getLogin(), filename);
         if (game != null) {
             activeGames.put(currentUser.getLogin(), game);
-            computerStrategies.put(currentUser.getLogin(), new ComputerStrategy());  // Новая стратегия
+
+            ComputerStrategy strategy = new ComputerStrategy();
+            restoreStrategyFromGame(game, strategy);
+            computerStrategies.put(currentUser.getLogin(), strategy);
+
             send(new Message(MessageType.GAME_STATE, game));
-            System.out.println(currentUser.getLogin() + " продолжил игру из " + filename);
+            System.out.println(currentUser.getLogin() + " продолжил игру из " + filename + " | Сложность: " + game.difficulty);
         } else {
             send(new Message(MessageType.ERROR, "Ошибка загрузки"));
         }
@@ -269,49 +281,63 @@ public class ClientHandler implements Runnable {
 
     private void computerTurn(Game game) throws IOException {
         ComputerStrategy strategy = computerStrategies.get(currentUser.getLogin());
+        if (strategy == null) {
+            strategy = new ComputerStrategy();
+            computerStrategies.put(currentUser.getLogin(), strategy);
+        }
+
         int[] shot = getComputerShot(game, strategy);
 
         int row = shot[0];
         int col = shot[1];
 
-        boolean hit = game.playerField[row][col];
-        game.playerHits[row][col] = true;
+        boolean hit = game.playerField[row][col] == Game.CELL_SHIP;
 
-        Ship sunkShip = null;
         if (hit) {
-            game.playerField[row][col] = false;
-            Ship ship = updateShipHits(game.playerShips, row, col);
-            if (ship != null && ship.hits == ship.size) {
-                sunkShip = ship;
+            game.computerShots[row][col] = Game.CELL_HIT;
+            game.playerField[row][col] = Game.CELL_HIT;
+
+            if (game.isShipSunk(game.playerShips, game.computerShots, row, col)) {
+                game.markSunkShip(game.playerShips, game.playerField, game.computerShots, row, col);
+                game.playerSunkShips++;
+
+                Ship sunkShip = findSunkShip(game.playerShips, row, col);
+                if (sunkShip != null) {
+                    Object[] payload = {sunkShip.cells, true}; // true — поле игрока
+                    send(new Message(MessageType.SHIP_SUNK, payload));
+
+                    for (int[] cell : sunkShip.cells) {
+                        strategy.hitCells.remove(cell[0] + "," + cell[1]);
+                    }
+                }
+                strategy.recordHit(row, col);
+            } else {
+                strategy.recordHit(row, col);
             }
-            strategy.recordHit(row, col);
+
+            if (game.playerSunkShips == game.playerShips.size()) {
+                game.gameOver = true;
+                game.playerWon = false;
+                send(new Message(MessageType.GAME_OVER, false));
+                gameDAO.deleteGame(currentUser.getLogin(), "autosave_latest.dat");
+                activeGames.remove(currentUser.getLogin());
+                computerStrategies.remove(currentUser.getLogin());
+                return;
+            }
         } else {
+            game.computerShots[row][col] = Game.CELL_MISS;
+            game.playerField[row][col] = Game.CELL_MISS;
+            game.isPlayerTurn = true;
             strategy.recordMiss();
         }
 
         send(new Message(MessageType.OPPONENT_SHOT, new int[]{row, col, hit ? 1 : 0}));
 
-        if (sunkShip != null) {
-            Object[] payload = {sunkShip.cells, true}; // true — поле игрока
-            send(new Message(MessageType.SHIP_SUNK, payload));
+        saveStrategyToGame(game);
 
-            ComputerStrategy compStrategy = computerStrategies.get(currentUser.getLogin());
-            if (compStrategy != null) {
-                for (int[] cell : sunkShip.cells) {
-                    compStrategy.hitCells.remove(cell[0] + "," + cell[1]);
-                }
-            }
-        }
+        gameDAO.autosaveLatest(currentUser.getLogin(), game);
 
-        if (allSunk(game.playerShips)) {
-            send(new Message(MessageType.GAME_OVER, false));
-            gameDAO.deleteGame(currentUser.getLogin(), "autosave_latest.dat");
-            activeGames.remove(currentUser.getLogin());
-            computerStrategies.remove(currentUser.getLogin());
-            return;
-        }
-
-        if (hit) {
+        if (hit && !game.gameOver) {
             new Thread(() -> {
                 try {
                     Thread.sleep(1000);
@@ -322,10 +348,6 @@ public class ClientHandler implements Runnable {
                     e.printStackTrace();
                 }
             }).start();
-        }
-        Game gameSave = activeGames.get(currentUser.getLogin());
-        if (gameSave != null) {
-            gameDAO.autosaveLatest(currentUser.getLogin(), gameSave);
         }
     }
 
@@ -338,11 +360,10 @@ public class ClientHandler implements Runnable {
         };
     }
 
-    private Ship updateShipHits(List<Ship> ships, int row, int col) {
+    private Ship findSunkShip(List<Ship> ships, int row, int col) {
         for (Ship ship : ships) {
             for (int[] cell : ship.cells) {
                 if (cell[0] == row && cell[1] == col) {
-                    ship.hits++;
                     return ship;
                 }
             }
@@ -350,8 +371,33 @@ public class ClientHandler implements Runnable {
         return null;
     }
 
-    private boolean allSunk(List<Ship> ships) {
-        return ships.stream().allMatch(s -> s.hits >= s.size);
+    private void saveStrategyToGame(Game game) {
+        ComputerStrategy strategy = computerStrategies.get(currentUser.getLogin());
+        if (strategy != null) {
+            game.computerHitCells.clear();
+
+            for (String hit : strategy.hitCells) {
+                String[] parts = hit.split(",");
+                game.computerHitCells.add(new int[]{
+                        Integer.parseInt(parts[0]),
+                        Integer.parseInt(parts[1])
+                });
+            }
+
+            game.computerLastHit = strategy.lastHit;
+            game.computerCurrentDirection = strategy.currentDirection;
+        }
+    }
+
+    private void restoreStrategyFromGame(Game game, ComputerStrategy strategy) {
+        if (game.computerHitCells != null) {
+            for (int[] hit : game.computerHitCells) {
+                strategy.hitCells.add(hit[0] + "," + hit[1]);
+            }
+        }
+
+        strategy.lastHit = game.computerLastHit;
+        strategy.currentDirection = game.computerCurrentDirection;
     }
 
     private void send(Message msg) throws IOException {
@@ -360,28 +406,26 @@ public class ClientHandler implements Runnable {
     }
 
     private void close() {
-        // Сначала — автосохранение при отключении (если была активная незавершённая игра)
         if (currentUser != null) {
             Game game = activeGames.get(currentUser.getLogin());
-            if (game != null) {  // на всякий случай, если игра не завершена
-                String filename = gameDAO.saveGame(currentUser.getLogin(), game, true);  // true = autosave с датой
+            if (game != null) {
+                saveStrategyToGame(game);
+
+                String filename = gameDAO.saveGame(currentUser.getLogin(), game, true);
                 if (filename != null) {
                     System.out.println("Автосохранение при отключении для " + currentUser.getLogin() + ": " + filename);
                 }
             }
         }
 
-        // Удаляем токен
         if (authToken != null) {
             activeTokens.remove(authToken);
         }
 
-        // Закрываем ресурсы
         try { if (out != null) out.close(); } catch (IOException ignored) {}
         try { if (in != null) in.close(); } catch (IOException ignored) {}
         try { socket.close(); } catch (IOException ignored) {}
 
-        // Опционально: можно удалить activeGame и стратегию здесь тоже
         if (currentUser != null) {
             activeGames.remove(currentUser.getLogin());
             computerStrategies.remove(currentUser.getLogin());
@@ -409,7 +453,7 @@ public class ClientHandler implements Runnable {
             do {
                 row = rnd.nextInt(10);
                 col = rnd.nextInt(10);
-            } while (game.playerHits[row][col]);
+            } while (game.computerShots[row][col] != Game.CELL_EMPTY);
             return new int[]{row, col};
         }
 
@@ -423,7 +467,8 @@ public class ClientHandler implements Runnable {
                     for (int[] d : dirs) {
                         int nr = r + d[0];
                         int nc = c + d[1];
-                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 && !game.playerHits[nr][nc]) {
+                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 &&
+                                game.computerShots[nr][nc] == Game.CELL_EMPTY) {
                             return new int[]{nr, nc};
                         }
                     }
@@ -440,7 +485,8 @@ public class ClientHandler implements Runnable {
                         for (int d = 0; d < 4; d++) {
                             int nr = lastHit[0] + dirs[d][0];
                             int nc = lastHit[1] + dirs[d][1];
-                            if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 && hitCells.contains(nr + "," + nc)) {
+                            if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 &&
+                                    hitCells.contains(nr + "," + nc)) {
                                 currentDirection = d;
                                 break;
                             }
@@ -449,13 +495,15 @@ public class ClientHandler implements Runnable {
                     if (currentDirection != -1) {
                         int nr = lastHit[0] + dirs[currentDirection][0];
                         int nc = lastHit[1] + dirs[currentDirection][1];
-                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 && !game.playerHits[nr][nc]) {
+                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 &&
+                                game.computerShots[nr][nc] == Game.CELL_EMPTY) {
                             return new int[]{nr, nc};
                         }
                         int opp = (currentDirection % 2 == 0) ? currentDirection + 1 : currentDirection - 1;
                         nr = lastHit[0] + dirs[opp][0];
                         nc = lastHit[1] + dirs[opp][1];
-                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 && !game.playerHits[nr][nc]) {
+                        if (nr >= 0 && nr < 10 && nc >= 0 && nc < 10 &&
+                                game.computerShots[nr][nc] == Game.CELL_EMPTY) {
                             return new int[]{nr, nc};
                         }
                     }

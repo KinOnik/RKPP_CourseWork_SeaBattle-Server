@@ -16,7 +16,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public class GameDAO {
     private static final String SAVES_DIR = "saves";
     private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
-    private final Lock lock = new ReentrantLock();  // Для синхронизации файловых операций
+    private final Lock lock = new ReentrantLock();
 
     public GameDAO() {
         new File(SAVES_DIR).mkdirs();
@@ -31,7 +31,7 @@ public class GameDAO {
             LocalDateTime now = LocalDateTime.now();
             String timestamp = now.format(FORMATTER);
             String prefix = isAuto ? "autosave_" : "save_";
-            String filename = prefix + timestamp + ".dat";
+            String filename = prefix + game.difficulty + "_" + timestamp + ".dat";
             String fullPath = userDir + "/" + filename;
 
             try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(fullPath))) {
@@ -88,17 +88,32 @@ public class GameDAO {
             if (!Files.exists(userDir)) return new ArrayList<>();
 
             List<Object[]> list = new ArrayList<>();
-            Files.list(userDir).forEach(path -> {
+
+            for (Path path : Files.list(userDir).toList()) {
                 String name = path.getFileName().toString();
-                if (name.endsWith(".dat")) {
-                    try {
-                        LocalDateTime dt = LocalDateTime.parse(name.substring(name.indexOf("_") + 1, name.lastIndexOf(".")), FORMATTER);
-                        long size = Files.size(path) / 1024;  // В KB
-                        list.add(new Object[]{name, dt.toLocalDate().toString(), dt.toLocalTime().toString(), size});
-                    } catch (Exception ignored) {}
-                }
-            });
+                if (!name.endsWith(".dat")) continue;
+                int timestampStart = name.indexOf("_20");
+                if (timestampStart == -1) continue;
+
+                String fullTimestamp = name.substring(timestampStart + 1, name.length() - 4);
+                try {
+                    LocalDateTime dt = LocalDateTime.parse(fullTimestamp, FORMATTER);
+
+                    int firstUnderscore = name.indexOf('_');
+                    int prefixEnd = name.indexOf('_', firstUnderscore + 1);
+
+                    String difficulty = (prefixEnd != -1 && prefixEnd < timestampStart)
+                            ? name.substring(prefixEnd + 1, timestampStart)
+                            : "Средний";
+
+                    long size = Files.size(path) / 1024;
+
+                    list.add(new Object[]{name, difficulty, dt.toLocalDate().toString(), dt.toLocalTime().toString(), size});
+
+                } catch (Exception ignored) {}
+            }
             return list;
+
         } catch (IOException e) {
             System.err.println("Ошибка списка игр для " + username + ": " + e.getMessage());
             return new ArrayList<>();
